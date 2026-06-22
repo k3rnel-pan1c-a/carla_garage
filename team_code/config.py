@@ -769,6 +769,19 @@ class GlobalConfig:
     self.input_path_to_target_speed_network = False
 
     # -----------------------------------------------------------------------------
+    # VLM-guided Zone-of-Interest (ZOI) module (Route 1: sparse relevance tokens)
+    # -----------------------------------------------------------------------------
+    self.use_zoi = False  # Whether to add the ZOI relevance-token module to the planner memory.
+    self.zoi_num_queries = 20  # Number N of learned ZOI queries/tokens.
+    # Which TransfuserBackbone fusion block (0-3) supplies the ZOI source feature grid.
+    # With the default lidar_architecture/lidar_resolution this is the 32x32 stage
+    # (block 3 is the 8x8 planner bottleneck). Verify the shape for other backbones.
+    self.zoi_src_stage = 1
+    self.zoi_num_decoder_layers = 2  # Depth of the DETR-style cross-attention decoder inside ZoiModule.
+    self.zoi_num_heads = 8  # Attention heads inside ZoiModule.
+    self.zoi_lambda = 1.0  # Weight of zoi_loss in the total loss (0.0 = unsupervised-ZOI ablation).
+
+    # -----------------------------------------------------------------------------
     # Agent file
     # -----------------------------------------------------------------------------
     self.carla_frame_rate = 1.0 / 20.0  # CARLA frame rate in milliseconds

@@ -9,6 +9,7 @@ from transfuser import TransfuserBackbone, TransformerDecoderLayerWithAttention,
 from bev_encoder import BevEncoder
 from aim import AIMBackbone
 from center_net import LidarCenterNetHead
+from zoi_module import ZoiModule
 import cv2
 
 import torch
@@ -16,7 +17,6 @@ from torch import nn
 import torch.nn.functional as F
 from PIL import Image
 from copy import deepcopy
-import math
 import os
 from nav_planner import LateralPIDController, get_throttle
 
@@ -43,6 +43,11 @@ class LidarCenterNet(nn.Module):
     else:
       raise ValueError('The chosen vision backbone does not exist. '
                        'The options are: transFuser, aim, bev_encoder')
+
+    if self.config.use_zoi:
+      assert self.config.backbone == 'transFuser', 'ZOI requires the transFuser backbone (fused LiDAR feature grid).'
+      assert self.config.transformer_decoder_join, 'ZOI tokens are concatenated onto the transformer decoder memory.'
+      self.zoi_module = ZoiModule(config, self.backbone.zoi_src_channels)
 
     if self.config.use_tp:
       target_point_size = 4 if self.config.two_tp_input else 2
@@ -147,7 +152,7 @@ class LidarCenterNet(nn.Module):
                                                   num_layers=self.config.num_transformer_decoder_layers,
                                                   norm=decoder_norm)
         # We don't have an encoder, so we directly use it on the features
-        self.encoder_pos_encoding = PositionEmbeddingSine(self.config.gru_input_size // 2, normalize=True)
+        self.encoder_pos_encoding = t_u.PositionEmbeddingSine(self.config.gru_input_size // 2, normalize=True)
         self.extra_sensor_pos_embed = nn.Parameter(torch.zeros(1, self.config.gru_input_size))
 
         self.change_channel = nn.Conv2d(self.backbone.num_features, self.config.gru_input_size, kernel_size=1)
@@ -287,7 +292,7 @@ class LidarCenterNet(nn.Module):
       target_point = torch.cat((target_point, target_point_next), axis=1)
 
     if self.config.backbone == 'transFuser':
-      bev_feature_grid, fused_features, image_feature_grid = self.backbone(rgb, lidar_bev)
+      bev_feature_grid, fused_features, image_feature_grid, zoi_feature_grid = self.backbone(rgb, lidar_bev)
     elif self.config.backbone == 'aim':
       fused_features, image_feature_grid = self.backbone(rgb)
     elif self.config.backbone == 'bev_encoder':
@@ -302,6 +307,8 @@ class LidarCenterNet(nn.Module):
     attention_weights = None
     pred_wp_1 = None
     selected_path = None
+    pred_zoi_xy = None
+    pred_zoi_imp = None
 
     if self.config.use_wp_gru or self.config.use_controller_input_prediction:
       if self.config.transformer_decoder_join:
@@ -329,6 +336,11 @@ class LidarCenterNet(nn.Module):
 
       if self.config.transformer_decoder_join:
         fused_features = torch.permute(fused_features, (0, 2, 1))
+
+        if self.config.use_zoi:
+          zoi_tokens, pred_zoi_xy, pred_zoi_imp = self.zoi_module(zoi_feature_grid)
+          fused_features = torch.cat((fused_features, zoi_tokens), axis=1)
+
         if self.config.use_wp_gru:
           if self.config.multi_wp_output:
             joined_wp_features = self.join(self.wp_query.repeat(bs, 1, 1), fused_features)
@@ -409,7 +421,7 @@ class LidarCenterNet(nn.Module):
       pred_bounding_box = self.head(bev_feature_grid)
 
     return pred_wp, pred_target_speed, pred_checkpoint, pred_semantic, pred_bev_semantic, pred_depth, \
-      pred_bounding_box, attention_weights, pred_wp_1, selected_path
+      pred_bounding_box, attention_weights, pred_wp_1, selected_path, pred_zoi_xy, pred_zoi_imp
 
   def compute_loss(self, pred_wp, pred_target_speed, pred_checkpoint, pred_semantic, pred_bev_semantic, pred_depth,
                    pred_bounding_box, pred_wp_1, selected_path, waypoint_label, target_speed_label, checkpoint_label,
@@ -964,43 +976,3 @@ class GRUWaypointsPredictorTransFuser(nn.Module):
     pred_wp = torch.stack(output_wp, dim=1)
 
     return pred_wp
-
-
-class PositionEmbeddingSine(nn.Module):
-  """
-  Taken from InterFuser
-  This is a more standard version of the position embedding, very similar to the one
-  used by the Attention is all you need paper, generalized to work on images.
-  """
-
-  def __init__(self, num_pos_feats=64, temperature=10000, normalize=False, scale=None):
-    super().__init__()
-    self.num_pos_feats = num_pos_feats
-    self.temperature = temperature
-    self.normalize = normalize
-    if scale is not None and normalize is False:
-      raise ValueError('normalize should be True if scale is passed')
-    if scale is None:
-      scale = 2 * math.pi
-    self.scale = scale
-
-  def forward(self, tensor):
-    x = tensor
-    bs, _, h, w = x.shape
-    not_mask = torch.ones((bs, h, w), device=x.device)
-    y_embed = not_mask.cumsum(1, dtype=torch.float32)
-    x_embed = not_mask.cumsum(2, dtype=torch.float32)
-    if self.normalize:
-      eps = 1e-6
-      y_embed = y_embed / (y_embed[:, -1:, :] + eps) * self.scale
-      x_embed = x_embed / (x_embed[:, :, -1:] + eps) * self.scale
-
-    dim_t = torch.arange(self.num_pos_feats, dtype=torch.float32, device=x.device)
-    dim_t = self.temperature**(2 * (torch.div(dim_t, 2, rounding_mode='floor')) / self.num_pos_feats)
-
-    pos_x = x_embed[:, :, :, None] / dim_t
-    pos_y = y_embed[:, :, :, None] / dim_t
-    pos_x = torch.stack((pos_x[:, :, :, 0::2].sin(), pos_x[:, :, :, 1::2].cos()), dim=4).flatten(3)
-    pos_y = torch.stack((pos_y[:, :, :, 0::2].sin(), pos_y[:, :, :, 1::2].cos()), dim=4).flatten(3)
-    pos = torch.cat((pos_y, pos_x), dim=3).permute(0, 3, 1, 2)
-    return pos

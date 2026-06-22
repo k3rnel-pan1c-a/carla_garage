@@ -98,6 +98,11 @@ class TransfuserBackbone(nn.Module):
     self.perspective_upsample_factor = self.image_encoder.feature_info.info[
         start_index + 3]['reduction'] // self.config.perspective_downsample_factor
 
+    if self.config.use_zoi:
+      # Channel count of the fused LiDAR feature map at the configured (higher-resolution,
+      # pre-bottleneck) fusion stage. Used by ZoiModule's input projection.
+      self.zoi_src_channels = self.lidar_encoder.feature_info.info[start_index + self.config.zoi_src_stage]['num_chs']
+
     if self.config.transformer_decoder_join:
       self.num_features = self.lidar_encoder.feature_info.info[start_index + 3]['num_chs']
     else:
@@ -167,11 +172,16 @@ class TransfuserBackbone(nn.Module):
       lidar_features = self.forward_layer_block(lidar_layers, self.lidar_encoder.return_layers, lidar_features)
 
     # Loop through the 4 blocks of the network.
+    zoi_feature_grid = None
     for i in range(4):
       image_features = self.forward_layer_block(image_layers, self.image_encoder.return_layers, image_features)
       lidar_features = self.forward_layer_block(lidar_layers, self.lidar_encoder.return_layers, lidar_features)
 
       image_features, lidar_features = self.fuse_features(image_features, lidar_features, i)
+
+      if self.config.use_zoi and i == self.config.zoi_src_stage:
+        # Genuine high-resolution fused feature grid for ZoiModule (NOT the 8x8 bottleneck).
+        zoi_feature_grid = torch.mean(lidar_features, dim=2) if self.lidar_video else lidar_features
 
     if self.config.detect_boxes or self.config.use_bev_semantic:
       # Average together any remaining temporal channels
@@ -202,7 +212,7 @@ class TransfuserBackbone(nn.Module):
     else:
       features = None
 
-    return features, fused_features, image_feature_grid
+    return features, fused_features, image_feature_grid, zoi_feature_grid
 
   def forward_layer_block(self, layers, return_layers, features):
     """

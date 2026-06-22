@@ -834,7 +834,8 @@ class Engine(object):
       pred_depth, \
       pred_bounding_box, _, \
       pred_wp_1, \
-      selected_path = self.model(rgb=rgb,
+      selected_path, \
+      _, _ = self.model(rgb=rgb,
                           lidar_bev=lidar,
                           target_point=target_point,
                           ego_vel=ego_vel,

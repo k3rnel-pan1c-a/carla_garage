@@ -523,7 +523,8 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
         pred_bb_features,\
         attention_weights,\
         pred_wp_1,\
-        selected_path = self.nets[i].forward(
+        selected_path, \
+        _, _ = self.nets[i].forward(
           rgb=tick_data['rgb'],
           lidar_bev=lidar_bev,
           target_point=tick_data['target_point'],
