@@ -371,6 +371,18 @@ def main():
                       type=str,
                       default=str(config.compile_mode),
                       help='compile mode for torch compile')
+  parser.add_argument('--use_zoi',
+                      type=int,
+                      default=int(config.use_zoi),
+                      help='Whether to add the VLM-guided ZOI token module to the planner memory.')
+  parser.add_argument('--zoi_lambda',
+                      type=float,
+                      default=float(config.zoi_lambda),
+                      help='Weight of zoi_loss in the total loss. 0.0 = unsupervised-ZOI ablation.')
+  parser.add_argument('--zoi_lr_multiplier',
+                      type=float,
+                      default=float(config.zoi_lr_multiplier),
+                      help='LR multiplier for ZoiModule parameters relative to the base LR.')
 
   args = parser.parse_args()
   args.logdir = os.path.join(args.logdir, args.id)
@@ -485,6 +497,10 @@ def main():
   if config.multi_wp_output:
     config.detailed_loss_weights['loss_selection'] = 1.0
 
+  if config.use_zoi:
+    config.detailed_loss_weights['loss_zoi'] = config.zoi_lambda
+  # else stays 0.0 from the config default
+
   if args.learn_multi_task_weights:
     for k in config.detailed_loss_weights:
       if config.detailed_loss_weights[k] > 0.0:
@@ -572,7 +588,17 @@ def main():
                                                     broadcast_buffers=False,
                                                     find_unused_parameters=find_unused_parameters)
 
-  if config.use_optim_groups:
+  if config.use_zoi:
+    # ZoiModule trains from scratch; give it a higher LR than the pretrained planner
+    # (which is only being fine-tuned to learn to consume the new tokens).
+    zoi_params = list(model.module.zoi_module.parameters())
+    zoi_ids = {id(p) for p in zoi_params}
+    base_params = [p for p in model.parameters() if id(p) not in zoi_ids]
+    params = [
+        {'params': base_params, 'lr': args.lr},
+        {'params': zoi_params, 'lr': args.lr * config.zoi_lr_multiplier},
+    ]
+  elif config.use_optim_groups:
     params = model.module.create_optimizer_groups(config.weight_decay)
   else:
     params = model.parameters()
@@ -825,6 +851,14 @@ class Engine(object):
         lidar = data['temporal_lidar'].to(self.device, dtype=torch.float32)
       else:
         lidar = data['lidar'].to(self.device, dtype=torch.float32)
+      if self.config.use_zoi:
+        zoi_xy_label = data['zoi_xy'].to(self.device, dtype=torch.float32)
+        zoi_imp_label = data['zoi_imp'].to(self.device, dtype=torch.float32)
+        zoi_mask = data['zoi_mask'].to(self.device, dtype=torch.float32)
+      else:
+        zoi_xy_label = None
+        zoi_imp_label = None
+        zoi_mask = None
 
       pred_wp,\
       pred_target_speed,\
@@ -835,7 +869,7 @@ class Engine(object):
       pred_bounding_box, _, \
       pred_wp_1, \
       selected_path, \
-      _, _ = self.model(rgb=rgb,
+      pred_zoi_xy, pred_zoi_imp = self.model(rgb=rgb,
                           lidar_bev=lidar,
                           target_point=target_point,
                           ego_vel=ego_vel,
@@ -880,7 +914,12 @@ class Engine(object):
                             pixel_weight_label=bb_pixel_weight,
                             avg_factor_label=bb_avg_factor,
                             pred_wp_1=pred_wp_1,
-                            selected_path=selected_path)
+                            selected_path=selected_path,
+                            pred_zoi_xy=pred_zoi_xy,
+                            pred_zoi_imp=pred_zoi_imp,
+                            zoi_xy_label=zoi_xy_label,
+                            zoi_imp_label=zoi_imp_label,
+                            zoi_mask=zoi_mask)
 
     # Compute metrics for logging
     metrics = {}

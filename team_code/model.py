@@ -423,11 +423,64 @@ class LidarCenterNet(nn.Module):
     return pred_wp, pred_target_speed, pred_checkpoint, pred_semantic, pred_bev_semantic, pred_depth, \
       pred_bounding_box, attention_weights, pred_wp_1, selected_path, pred_zoi_xy, pred_zoi_imp
 
+  def _compute_zoi_loss(self, pred_xy, pred_imp, tgt_xy, tgt_imp, tgt_mask):
+    """
+    Batched DETR-style ZOI loss with Hungarian matching.
+
+    pred_xy:  [B, N, 2]  predicted positions in ego BEV meters
+    pred_imp: [B, N]     predicted importance logits (pre-sigmoid)
+    tgt_xy:   [B, M, 2]  padded GT positions
+    tgt_imp:  [B, M]     padded GT importances in [0, 1]
+    tgt_mask: [B, M]     1 for valid GT slots, 0 for padding
+
+    Matched queries are supervised on both position (L1) and importance (BCE to the
+    GT importance). Unmatched queries ("no object") are supervised on importance only,
+    pushed toward 0, so the importance score that gates the tokens learns to mean
+    "(ir)relevance" rather than collapsing to a constant.
+    """
+    from scipy.optimize import linear_sum_assignment
+    bs = pred_xy.shape[0]
+    loss_pos = pred_xy.new_zeros(())
+    loss_imp = pred_xy.new_zeros(())
+    n_matched = 0
+
+    for b in range(bs):
+      valid = tgt_mask[b].bool()  # [M]
+      m = int(valid.sum().item())
+
+      # All queries get a "no object" importance target of 0 by default; matched
+      # queries below overwrite their target with the GT importance.
+      imp_target = pred_imp.new_zeros(pred_imp.shape[1])  # [N]
+
+      if m > 0:
+        p_xy = pred_xy[b]          # [N, 2]
+        t_xy = tgt_xy[b][valid]    # [m, 2]
+        t_imp = tgt_imp[b][valid]  # [m]
+
+        # Match on position only: stable and avoids coupling matching to the (noisy) importance.
+        cost = torch.cdist(p_xy.detach(), t_xy.detach(), p=1).cpu().numpy()  # [N, m]
+        ri, ci = linear_sum_assignment(cost)
+
+        idx_pred = torch.as_tensor(ri, device=pred_xy.device, dtype=torch.long)
+        idx_tgt = torch.as_tensor(ci, device=pred_xy.device, dtype=torch.long)
+
+        loss_pos = loss_pos + F.l1_loss(p_xy[idx_pred], t_xy[idx_tgt], reduction='sum')
+        imp_target[idx_pred] = t_imp[idx_tgt]
+        n_matched += len(ri)
+
+      # Importance BCE over ALL queries (matched -> GT importance, unmatched -> 0).
+      loss_imp = loss_imp + F.binary_cross_entropy_with_logits(pred_imp[b], imp_target, reduction='mean')
+
+    loss_pos = loss_pos / max(n_matched, 1)
+    loss_imp = loss_imp / bs
+    return loss_pos + loss_imp
+
   def compute_loss(self, pred_wp, pred_target_speed, pred_checkpoint, pred_semantic, pred_bev_semantic, pred_depth,
                    pred_bounding_box, pred_wp_1, selected_path, waypoint_label, target_speed_label, checkpoint_label,
                    semantic_label, bev_semantic_label, depth_label, center_heatmap_label, wh_label, yaw_class_label,
                    yaw_res_label, offset_label, velocity_label, brake_target_label, pixel_weight_label,
-                   avg_factor_label):
+                   avg_factor_label, pred_zoi_xy=None, pred_zoi_imp=None, zoi_xy_label=None, zoi_imp_label=None,
+                   zoi_mask=None):
     loss = {}
     if self.config.use_wp_gru:
       if self.config.multi_wp_output:
@@ -473,6 +526,10 @@ class LidarCenterNet(nn.Module):
                                  brake_target_label, pixel_weight_label, avg_factor_label)
 
       loss.update(loss_bbox)
+
+    if self.config.use_zoi and pred_zoi_xy is not None and zoi_xy_label is not None:
+      loss_zoi = self._compute_zoi_loss(pred_zoi_xy, pred_zoi_imp, zoi_xy_label, zoi_imp_label, zoi_mask)
+      loss.update({'loss_zoi': loss_zoi})
 
     return loss
 

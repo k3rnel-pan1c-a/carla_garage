@@ -500,6 +500,7 @@ class GlobalConfig:
         'loss_brake': 1.0,
         'loss_forcast': 0.2,
         'loss_selection': 0.0,
+        'loss_zoi': 0.0,
     }
     self.root_dir = ''
     self.val_towns = []
@@ -780,6 +781,8 @@ class GlobalConfig:
     self.zoi_num_decoder_layers = 2  # Depth of the DETR-style cross-attention decoder inside ZoiModule.
     self.zoi_num_heads = 8  # Attention heads inside ZoiModule.
     self.zoi_lambda = 1.0  # Weight of zoi_loss in the total loss (0.0 = unsupervised-ZOI ablation).
+    self.zoi_m_max = 20  # Max GT objects per frame kept for loss; extras are clipped.
+    self.zoi_lr_multiplier = 10.0  # LR multiplier applied to ZoiModule relative to the base LR.
 
     # -----------------------------------------------------------------------------
     # Agent file

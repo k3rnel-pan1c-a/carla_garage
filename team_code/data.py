@@ -735,6 +735,34 @@ class CARLA_Data(Dataset):  # pylint: disable=locally-disabled, invalid-name
                                                   yaw_augmentation=aug_rotation)
     data['target_point_next'] = target_point_next
 
+    if self.config.use_zoi:
+      # Derive label path from the current-frame rgb path (images[0]).
+      img_path = str(images[0], encoding='utf-8')  # .../route/rgb/0042.jpg
+      frame_str = os.path.splitext(os.path.basename(img_path))[0]
+      route_dir = os.path.dirname(os.path.dirname(img_path))
+      label_path = os.path.join(route_dir, 'zoi_labels', frame_str + '.npy')
+
+      M_max = self.config.zoi_m_max
+      zoi_xy = np.zeros((M_max, 2), dtype=np.float32)
+      zoi_imp = np.zeros((M_max,), dtype=np.float32)
+      zoi_mask = np.zeros((M_max,), dtype=np.float32)
+
+      if os.path.isfile(label_path):
+        raw = np.load(label_path)  # [M, 4]: x, y, importance, class_id
+        if raw.ndim == 2 and raw.shape[0] > 0 and raw.shape[1] >= 3:
+          m = min(raw.shape[0], M_max)
+          xy = raw[:m, :2].astype(np.float32)
+          # Apply the same viewpoint augmentation as the route/boxes so the labels stay
+          # aligned when the augmented camera is used (identity when augment is off).
+          xy = self.augment_route(xy, y_augmentation=aug_translation, yaw_augmentation=aug_rotation)
+          zoi_xy[:m] = xy
+          zoi_imp[:m] = raw[:m, 2]
+          zoi_mask[:m] = 1.0
+
+      data['zoi_xy'] = zoi_xy      # [M_max, 2]  ego-BEV meters
+      data['zoi_imp'] = zoi_imp    # [M_max]      importance in [0,1]
+      data['zoi_mask'] = zoi_mask  # [M_max]      1=valid GT, 0=padding
+
     return data
 
   def get_targets(self, gt_bboxes, feat_h, feat_w):
